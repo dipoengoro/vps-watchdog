@@ -1,0 +1,117 @@
+name: VPS Watchdog (eksternal)
+
+# Watchdog dari LUAR VPS: jalan di infrastruktur GitHub, bukan di server Dipo.
+# Gunanya: kalau VPS mati total (semua alat alert di dalam VPS ikut mati),
+# workflow ini yang ngirim notifikasi (Telegram + Pushover) + bikin issue incident.
+#
+# CATATAN PENTING soal jalur notifikasi:
+# Telegram = jalur utama (terbukti jalan). Pushover = cadangan, dan Pushover
+# cuma NYAMPE kalau akun Pushover-nya punya device aktif (app login di HP).
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Tes paksa: fail | ok (kosongkan buat cek beneran)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: vps-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+      PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+      TARGET: https://health.dipo.sh/
+      TARGET2: https://dipo.sh/
+    steps:
+      - name: Probe VPS dari luar
+        id: probe
+        run: |
+          FORCE="${{ github.event.inputs.force }}"
+          if [ "$FORCE" = "fail" ]; then
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            echo "detail=forced failure (tes manual)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ok=0
+          code=""
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$TARGET" || echo 000)
+            case "$code" in
+              200|301|302|401|403) ok=1; break ;;
+              *) ok=0 ;;
+            esac
+            sleep 15
+          done
+          second=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$TARGET2" || echo 000)
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "detail=health.dipo.sh=$code dipo.sh=$second @ $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_OUTPUT"
+
+      - name: Notifikasi + catat incident
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OK: ${{ steps.probe.outputs.ok }}
+          DETAIL: ${{ steps.probe.outputs.detail }}
+        run: |
+          set -uo pipefail
+          tg() {
+            curl -s -m 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "message_thread_id=57" \
+              --data-urlencode "text=$1" \
+              --data-urlencode "disable_web_page_preview=true" > /dev/null || true
+          }
+          push() {
+            prio="$3"
+            if [ "$prio" = "2" ]; then
+              extra="--data-urlencode priority=2 --data-urlencode retry=300 --data-urlencode expire=3600"
+            else
+              extra="--data-urlencode priority=0"
+            fi
+            # shellcheck disable=SC2086
+            curl -s -m 20 -X POST https://api.pushover.net/1/messages.json \
+              --data-urlencode "token=$PUSHOVER_TOKEN" \
+              --data-urlencode "user=$PUSHOVER_USER" \
+              --data-urlencode "title=$1" \
+              --data-urlencode "message=$2" \
+              --data-urlencode "sound=siren" \
+              $extra > /dev/null || true
+          }
+
+          open_count=$(gh issue list --repo "$GITHUB_REPOSITORY" --label incident --state open --json number --jq 'length')
+
+          if [ "$OK" = "0" ] && [ "$open_count" = "0" ]; then
+            body=$(printf 'VPS tidak merespons dari luar VPS.\n\nDetail: %s\n\nDicek oleh GitHub Actions: %s/%s/actions/runs/%s' \
+              "$DETAIL" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+            gh issue create --repo "$GITHUB_REPOSITORY" --label incident \
+              --title "VPS DOWN — mulai $(date -u '+%Y-%m-%d %H:%M UTC')" --body "$body"
+            tg "🚨 VPS DOWN (watchdog eksternal)
+          VPS tidak merespons dari luar: $DETAIL
+          Incident issue: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/issues"
+            push "🚨 VPS DOWN" "VPS tidak merespons dari luar. $DETAIL" 2
+            echo "incident dibuka + notifikasi dikirim"
+          elif [ "$OK" = "1" ] && [ "$open_count" != "0" ]; then
+            num=$(gh issue list --repo "$GITHUB_REPOSITORY" --label incident --state open --json number --jq '.[0].number')
+            gh issue comment "$num" --repo "$GITHUB_REPOSITORY" --body "VPS merespons lagi: $DETAIL"
+            gh issue close "$num" --repo "$GITHUB_REPOSITORY" --reason completed
+            tg "✅ VPS UP lagi (watchdog eksternal)
+          VPS sudah merespons: $DETAIL"
+            push "✅ VPS UP lagi" "VPS sudah merespons. $DETAIL" 0
+            echo "incident ditutup + notifikasi recovery dikirim"
+          else
+            echo "status tidak berubah (ok=$OK, open_incident=$open_count)"
+          fi
