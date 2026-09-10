@@ -1,0 +1,31 @@
+name: Heartbeat (jaga scheduled workflow tetap aktif)
+
+# GitHub menonaktifkan scheduled workflow kalau repo-nya nggak ada aktivitas
+# 60 hari. Commit bulanan ini menjaga repo tetap "hidup" biar watchdog VPS
+# nggak mati sendiri.
+
+on:
+  schedule:
+    - cron: "0 4 1 * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit heartbeat
+        run: |
+          date -u '+%Y-%m-%d %H:%M UTC' > heartbeat.txt
+          git config user.name "vps-watchdog"
+          git config user.email "actions@users.noreply.github.com"
+          git add heartbeat.txt
+          if git diff --cached --quiet; then
+            echo "tidak ada perubahan"
+            exit 0
+          fi
+          git commit -m "heartbeat $(date -u '+%Y-%m')"
+          git push
